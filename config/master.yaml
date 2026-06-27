@@ -1,0 +1,24 @@
+role: master
+
+master:
+  terminal_path: "C:\\Trading\\MetaTraderMaster\\terminal64.exe"
+  login: 474114385
+  password: "Investor@123"
+  server: "XYLOMARKETS-server"
+
+symbol_mapping:
+  XAUUSD: XAUUSDm
+  EURUSD: EURUSD.a
+  GBPUSD: GBPUSDm
+  BTCUSD: BTCUSDm
+
+settings:
+  poll_interval_ms: 250
+  max_retries: 3
+  retry_delay_ms: 500
+  reconnect_max_wait_s: 60
+  detection_latency_target_ms: 500
+  copy_latency_target_ms: 1000
+  db_path: "trade_copier.db"
+  log_level: "INFO"
+  enable_dashboard: true

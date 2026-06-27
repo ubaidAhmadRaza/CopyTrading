@@ -1,0 +1,53 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Databases and runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+trade_copier.db
+trade_copier.db-shm
+trade_copier.db-wal
+ReadMe.md
+
+deploy/
+
+# Logs
+logs/
+*.log
+
+# Local assistant/editor state
+.claude/
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

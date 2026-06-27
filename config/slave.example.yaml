@@ -1,0 +1,44 @@
+# Example SLAVE config showing all available options including risk management.
+# One slave process drives ONE terminal. Run a separate process + config per
+# slave account.
+role: slave
+
+slaves:
+  - terminal_path: "C:\\Trading\\MetaTraderSlave\\terminal64.exe"
+    login: 262967799
+    password: ${SLAVE_PASSWORD}     # expanded from environment / .env
+    server: "Exness-MT5Trial16"
+
+    mode: copy                      # copy | reverse
+    lot_mode: ratio                 # fixed | multiplier | ratio | risk_percent
+    lot_value: 1.0
+    max_lot: 10.0
+    min_lot: 0.01
+    enabled: true
+
+    risk:
+      max_spread_points: 30         # 0 = disabled
+      max_slippage_points: 20       # order deviation
+      max_lot: 5.0                  # hard cap on top of broker limit
+      max_daily_loss: 500.0         # account currency; 0 = disabled
+      allowed_symbols: []           # empty = all allowed
+      blacklist_symbols: ["BTCUSD"]
+      trading_sessions: []          # e.g. ["07:00-21:00"] UTC; empty = 24h
+      check_margin: true
+
+symbol_mapping:
+  XAUUSD: XAUUSDm
+  EURUSD: EURUSD.a
+  GBPUSD: GBPUSDm
+  BTCUSD: BTCUSDm
+
+settings:
+  sync_interval_ms: 100
+  reconcile_interval_s: 30
+  heartbeat_interval_s: 5
+  max_retries: 3
+  retry_delay_ms: 500
+  reconnect_max_wait_s: 60
+  db_path: "trade_copier.db"
+  log_level: "INFO"
+  enable_dashboard: false
