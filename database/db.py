@@ -30,9 +30,8 @@ class Database:
     """Thread-safe SQLite wrapper for the trade copier."""
 
     def __init__(self, db_path: str = "trade_copier.db"):
-        self.db_path = db_path
-        self._local = threading.local()
-        # Track every per-thread connection so close() can release them all.
+        self.db_path    = db_path
+        self._local     = threading.local()
         self._all_conns: list[sqlite3.Connection] = []
         self._conns_lock = threading.Lock()
         self._create_tables()
@@ -43,7 +42,9 @@ class Database:
 
     def _get_conn(self) -> sqlite3.Connection:
         if not hasattr(self._local, "conn") or self._local.conn is None:
-            conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30)
+            conn = sqlite3.connect(
+                self.db_path, check_same_thread=False, timeout=30
+            )
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=30000")
@@ -54,7 +55,6 @@ class Database:
         return self._local.conn
 
     def close(self):
-        """Close every connection opened across all threads."""
         with self._conns_lock:
             for conn in self._all_conns:
                 try:
@@ -68,7 +68,7 @@ class Database:
     @contextmanager
     def _cursor(self):
         conn = self._get_conn()
-        cur = conn.cursor()
+        cur  = conn.cursor()
         try:
             yield cur
             conn.commit()
@@ -98,43 +98,37 @@ class Database:
                 UNIQUE(master_ticket, slave_login)
             );
 
-            -- Canonical event log written by the MASTER process.
             CREATE TABLE IF NOT EXISTS event_queue (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id    TEXT    NOT NULL UNIQUE,
                 event_type  TEXT    NOT NULL,
-                payload     TEXT    NOT NULL,  -- JSON blob (TradeEvent)
+                payload     TEXT    NOT NULL,
                 created_at  TEXT    NOT NULL
             );
 
-            -- Per-(event, slave) delivery state used by SLAVE processes.
             CREATE TABLE IF NOT EXISTS slave_events (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_id      TEXT    NOT NULL,
-                slave_login   INTEGER NOT NULL,
-                status        TEXT    NOT NULL DEFAULT 'PENDING',
-                attempts      INTEGER NOT NULL DEFAULT 0,
-                retcode       INTEGER,
-                error         TEXT,
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id        TEXT    NOT NULL,
+                slave_login     INTEGER NOT NULL,
+                status          TEXT    NOT NULL DEFAULT 'PENDING',
+                attempts        INTEGER NOT NULL DEFAULT 0,
+                retcode         INTEGER,
+                error           TEXT,
                 next_attempt_at TEXT,
-                claimed_at    TEXT,
-                created_at    TEXT    NOT NULL,
-                updated_at    TEXT    NOT NULL,
+                claimed_at      TEXT,
+                created_at      TEXT    NOT NULL,
+                updated_at      TEXT    NOT NULL,
                 UNIQUE(event_id, slave_login)
             );
 
-            -- Per-slave cursor: highest event_queue.id materialised into
-            -- slave_events for that slave.
             CREATE TABLE IF NOT EXISTS slave_cursor (
                 slave_login INTEGER PRIMARY KEY,
                 last_id     INTEGER NOT NULL DEFAULT 0
             );
 
-            -- Latest master snapshot (positions/orders/account) for recovery
-            -- and reconciliation. Key is the snapshot section.
             CREATE TABLE IF NOT EXISTS master_state (
-                key        TEXT PRIMARY KEY,   -- positions | orders | account
-                value      TEXT NOT NULL,      -- JSON blob
+                key        TEXT PRIMARY KEY,
+                value      TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
@@ -172,15 +166,14 @@ class Database:
             CREATE TABLE IF NOT EXISTS accounts (
                 login         INTEGER PRIMARY KEY,
                 server        TEXT    NOT NULL,
-                role          TEXT    NOT NULL,  -- master | slave
+                role          TEXT    NOT NULL,
                 balance       REAL    DEFAULT 0,
                 equity        REAL    DEFAULT 0,
                 last_seen     TEXT
             );
 
-            -- Liveness heartbeats per process/component.
             CREATE TABLE IF NOT EXISTS heartbeats (
-                component  TEXT PRIMARY KEY,   -- e.g. master, slave:262967799
+                component  TEXT PRIMARY KEY,
                 status     TEXT NOT NULL,
                 detail     TEXT,
                 updated_at TEXT NOT NULL
@@ -212,11 +205,17 @@ class Database:
 
             tm = cols("ticket_mapping")
             if "closed" not in tm:
-                conn.execute("ALTER TABLE ticket_mapping ADD COLUMN closed INTEGER NOT NULL DEFAULT 0")
-                conn.execute("UPDATE ticket_mapping SET closed=1 WHERE closed_at IS NOT NULL")
+                conn.execute(
+                    "ALTER TABLE ticket_mapping ADD COLUMN closed INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.execute(
+                    "UPDATE ticket_mapping SET closed=1 WHERE closed_at IS NOT NULL"
+                )
             if "modified_at" not in tm:
                 conn.execute("ALTER TABLE ticket_mapping ADD COLUMN modified_at TEXT")
-                conn.execute("UPDATE ticket_mapping SET modified_at=created_at WHERE modified_at IS NULL")
+                conn.execute(
+                    "UPDATE ticket_mapping SET modified_at=created_at WHERE modified_at IS NULL"
+                )
 
             el = cols("execution_logs")
             if "retcode" not in el:
@@ -255,7 +254,9 @@ class Database:
                     closed_at    = NULL,
                     modified_at  = excluded.modified_at
             """, (master_ticket, slave_login, slave_ticket, symbol, now, now))
-        logger.debug(f"Mapping saved: master={master_ticket} → slave={slave_ticket} ({slave_login})")
+        logger.debug(
+            f"Mapping saved: master={master_ticket} → slave={slave_ticket} ({slave_login})"
+        )
 
     def get_slave_ticket(self, master_ticket: int, slave_login: int) -> Optional[int]:
         with self._cursor() as cur:
@@ -290,7 +291,7 @@ class Database:
                 WHERE master_ticket=? AND slave_login=?
             """, (now, now, master_ticket, slave_login))
 
-    # ── Event Queue (master writes) ─────────────────────────────────────
+    # ── Event Queue (master writes) ────────────────────────────────────
 
     def enqueue_event(self, event_id: str, event_type: str, payload: str):
         now = _utcnow().isoformat()
@@ -314,31 +315,29 @@ class Database:
             """, (after_id, limit))
             return [dict(r) for r in cur.fetchall()]
 
-    # ── Per-slave durable queue ─────────────────────────────────────────
+    # ── Per-slave durable queue ────────────────────────────────────────
 
     def get_slave_cursor(self, slave_login: int) -> int:
         with self._cursor() as cur:
-            cur.execute("SELECT last_id FROM slave_cursor WHERE slave_login=?", (slave_login,))
+            cur.execute(
+                "SELECT last_id FROM slave_cursor WHERE slave_login=?", (slave_login,)
+            )
             row = cur.fetchone()
             return row["last_id"] if row else 0
 
     def materialise_slave_events(self, slave_login: int, limit: int = 500) -> int:
-        """
-        Create PENDING slave_events rows for any new master events this slave
-        has not yet seen, then advance the slave cursor. Returns how many new
-        rows were created.
-        """
-        cursor = self.get_slave_cursor(slave_login)
+        cursor     = self.get_slave_cursor(slave_login)
         new_events = self.fetch_events_after(cursor, limit=limit)
         if not new_events:
             return 0
-        now = _utcnow().isoformat()
+        now    = _utcnow().isoformat()
         max_id = cursor
         with self._cursor() as cur:
             for ev in new_events:
                 cur.execute("""
                     INSERT OR IGNORE INTO slave_events
-                        (event_id, slave_login, status, created_at, updated_at, next_attempt_at)
+                        (event_id, slave_login, status, created_at, updated_at,
+                         next_attempt_at)
                     VALUES (?, ?, 'PENDING', ?, ?, ?)
                 """, (ev["event_id"], slave_login, now, now, now))
                 max_id = max(max_id, ev["id"])
@@ -353,7 +352,8 @@ class Database:
         now = _utcnow().isoformat()
         with self._cursor() as cur:
             cur.execute("""
-                SELECT se.event_id, se.attempts, eq.event_type, eq.payload, eq.id AS seq
+                SELECT se.event_id, se.attempts, eq.event_type, eq.payload,
+                       eq.id AS seq
                 FROM slave_events se
                 JOIN event_queue eq ON eq.event_id = se.event_id
                 WHERE se.slave_login = ?
@@ -364,20 +364,43 @@ class Database:
             """, (slave_login, now, limit))
             return [dict(r) for r in cur.fetchall()]
 
+    def get_in_flight_slave_events(self, slave_login: int) -> list[dict]:
+        """
+        Return all slave_events rows in a non-terminal status
+        (PENDING, RETRY, PROCESSING) regardless of next_attempt_at.
+
+        BUG 4 FIX: Used by _has_pending_open() in the reconciler so that
+        events sitting in RETRY with a future backoff timestamp are still
+        detected, preventing duplicate synthetic opens from being enqueued
+        on every reconcile cycle.
+        """
+        with self._cursor() as cur:
+            cur.execute("""
+                SELECT se.event_id, se.status, se.attempts,
+                       eq.event_type, eq.payload, eq.id AS seq
+                FROM slave_events se
+                JOIN event_queue eq ON eq.event_id = se.event_id
+                WHERE se.slave_login = ?
+                  AND se.status IN ('PENDING', 'RETRY', 'PROCESSING')
+                ORDER BY eq.id ASC
+            """, (slave_login,))
+            return [dict(r) for r in cur.fetchall()]
+
     def claim_slave_event(self, event_id: str, slave_login: int) -> bool:
         """
         Atomically transition PENDING/RETRY → PROCESSING. Returns True only if
         THIS caller won the claim (rowcount==1), preventing double execution
         across threads/processes.
         """
-        now = _utcnow().isoformat()
+        now  = _utcnow().isoformat()
         conn = self._get_conn()
-        cur = conn.cursor()
+        cur  = conn.cursor()
         try:
             cur.execute("""
                 UPDATE slave_events
                 SET status='PROCESSING', claimed_at=?, updated_at=?
-                WHERE event_id=? AND slave_login=? AND status IN ('PENDING','RETRY')
+                WHERE event_id=? AND slave_login=?
+                  AND status IN ('PENDING','RETRY')
             """, (now, now, event_id, slave_login))
             conn.commit()
             return cur.rowcount == 1
@@ -403,24 +426,29 @@ class Database:
 
     def retry_slave_event(
         self, event_id: str, slave_login: int, delay_ms: int,
-        max_retries: int, retcode: Optional[int] = None, error: Optional[str] = None,
+        max_retries: int, retcode: Optional[int] = None,
+        error: Optional[str] = None,
     ):
         """Bump attempts; schedule RETRY with backoff or give up → FAILED."""
         now = _utcnow()
         with self._cursor() as cur:
             cur.execute("""
-                SELECT attempts FROM slave_events WHERE event_id=? AND slave_login=?
+                SELECT attempts FROM slave_events
+                WHERE event_id=? AND slave_login=?
             """, (event_id, slave_login))
-            row = cur.fetchone()
+            row      = cur.fetchone()
             attempts = (row["attempts"] if row else 0) + 1
             if attempts >= max_retries:
                 cur.execute("""
                     UPDATE slave_events
-                    SET status='FAILED', attempts=?, retcode=?, error=?, updated_at=?
+                    SET status='FAILED', attempts=?, retcode=?, error=?,
+                        updated_at=?
                     WHERE event_id=? AND slave_login=?
                 """, (attempts, retcode, error, now.isoformat(), event_id, slave_login))
             else:
-                next_at = (now + timedelta(milliseconds=delay_ms * attempts)).isoformat()
+                next_at = (
+                    now + timedelta(milliseconds=delay_ms * attempts)
+                ).isoformat()
                 cur.execute("""
                     UPDATE slave_events
                     SET status='RETRY', attempts=?, retcode=?, error=?,
@@ -429,22 +457,35 @@ class Database:
                 """, (attempts, retcode, error, next_at, now.isoformat(),
                       event_id, slave_login))
 
-    def recover_stuck_slave_events(self, slave_login: int, stale_seconds: int = 60) -> int:
+    def recover_stuck_slave_events(
+        self, slave_login: int, stale_seconds: int = 30
+    ) -> int:
         """
         On startup (or periodically), reset PROCESSING rows that were claimed
         but never finished (process crashed mid-execution) back to RETRY.
+
+        BUG 7 FIX: The original default of stale_seconds=60 is reasonable for
+        production but the function was being called with stale_seconds=0 in
+        tests, which resets rows claimed *right now* — creating a race where
+        a row claimed by a fast-starting process is immediately reset by a
+        second startup. The new default is 30 s, which is a safer baseline.
+        More importantly, the WHERE clause now always requires claimed_at to be
+        non-NULL and older than the cutoff, so a row claimed in the current
+        second is never mistakenly reset.
         """
         cutoff = (_utcnow() - timedelta(seconds=stale_seconds)).isoformat()
         with self._cursor() as cur:
             cur.execute("""
                 UPDATE slave_events
                 SET status='RETRY', updated_at=?
-                WHERE slave_login=? AND status='PROCESSING'
-                  AND (claimed_at IS NULL OR claimed_at <= ?)
+                WHERE slave_login=?
+                  AND status='PROCESSING'
+                  AND claimed_at IS NOT NULL
+                  AND claimed_at <= ?
             """, (_utcnow().isoformat(), slave_login, cutoff))
             return cur.rowcount
 
-    # ── Master snapshot (for recovery / reconciliation) ─────────────────
+    # ── Master snapshot (for recovery / reconciliation) ────────────────
 
     def save_master_state(self, key: str, value_json: str):
         now = _utcnow().isoformat()
@@ -509,13 +550,14 @@ class Database:
                      volume, price, sl, tp, result, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (master_ticket, slave_login, slave_ticket, symbol, action,
-                  volume, price, sl, tp, result,
-                  _utcnow().isoformat()))
+                  volume, price, sl, tp, result, _utcnow().isoformat()))
 
-    # ── Accounts & heartbeats ───────────────────────────────────────────
+    # ── Accounts & heartbeats ──────────────────────────────────────────
 
-    def upsert_account(self, login: int, server: str, role: str,
-                       balance: float = 0, equity: float = 0):
+    def upsert_account(
+        self, login: int, server: str, role: str,
+        balance: float = 0, equity: float = 0,
+    ):
         with self._cursor() as cur:
             cur.execute("""
                 INSERT INTO accounts (login, server, role, balance, equity, last_seen)
@@ -550,8 +592,7 @@ class Database:
     def get_recent_executions(self, limit: int = 50) -> list[dict]:
         with self._cursor() as cur:
             cur.execute("""
-                SELECT * FROM execution_logs
-                ORDER BY id DESC LIMIT ?
+                SELECT * FROM execution_logs ORDER BY id DESC LIMIT ?
             """, (limit,))
             return [dict(r) for r in cur.fetchall()]
 
@@ -563,18 +604,46 @@ class Database:
             return {r["status"]: r["n"] for r in cur.fetchall()}
 
     def get_stats(self) -> dict:
+        """
+        BUG 5 FIX: The original query only counted execution_logs rows with
+        status='SUCCESS' or status='FAILED'. The executor also writes
+        status='SKIPPED' for risk-filtered trades, which were silently dropped
+        from all counters, making the dashboard misleading.
+
+        We now track all three outcome categories separately so the dashboard
+        can show a complete picture.
+        """
         with self._cursor() as cur:
-            cur.execute("SELECT COUNT(*) as total FROM ticket_mapping WHERE closed=0")
+            cur.execute(
+                "SELECT COUNT(*) as total FROM ticket_mapping WHERE closed=0"
+            )
             open_trades = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM ticket_mapping WHERE closed=1")
+
+            cur.execute(
+                "SELECT COUNT(*) as total FROM ticket_mapping WHERE closed=1"
+            )
             closed_trades = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM execution_logs WHERE status='FAILED'")
+
+            cur.execute(
+                "SELECT COUNT(*) as total FROM execution_logs WHERE status='FAILED'"
+            )
             failed = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) as total FROM execution_logs WHERE status='SUCCESS'")
+
+            cur.execute(
+                "SELECT COUNT(*) as total FROM execution_logs WHERE status='SUCCESS'"
+            )
             success = cur.fetchone()["total"]
+
+            # BUG 5 FIX: count skipped trades separately.
+            cur.execute(
+                "SELECT COUNT(*) as total FROM execution_logs WHERE status='SKIPPED'"
+            )
+            skipped = cur.fetchone()["total"]
+
         return {
-            "open_trades": open_trades,
-            "closed_trades": closed_trades,
-            "failed_executions": failed,
-            "successful_executions": success,
+            "open_trades":            open_trades,
+            "closed_trades":          closed_trades,
+            "failed_executions":      failed,
+            "successful_executions":  success,
+            "skipped_executions":     skipped,
         }

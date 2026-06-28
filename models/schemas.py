@@ -48,6 +48,7 @@ class LotMode(str, Enum):
     MULTIPLIER = "multiplier"
     RATIO = "ratio"
     RISK_PERCENT = "risk_percent"
+    EXACT = "exact"
 
 
 class CopyMode(str, Enum):

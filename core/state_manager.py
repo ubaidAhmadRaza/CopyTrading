@@ -37,7 +37,7 @@ def parse_position(p) -> Position:
         sl=p.sl,
         tp=p.tp,
         profit=p.profit,
-        open_time=p.time,          # already a datetime via MT5 lib
+        open_time=p.time,
         comment=p.comment or "",
         magic=p.magic,
     )
@@ -69,8 +69,8 @@ class StateManager:
     """
 
     def __init__(self):
-        self._positions: dict[int, Position] = {}        # ticket → Position
-        self._orders: dict[int, PendingOrder] = {}       # ticket → PendingOrder
+        self._positions: dict[int, Position]     = {}
+        self._orders:    dict[int, PendingOrder] = {}
         self._initialised = False
 
     # ── Public ────────────────────────────────────────────────────────
@@ -78,7 +78,7 @@ class StateManager:
     def compare(
         self,
         new_positions: list[Position],
-        new_orders: list[PendingOrder],
+        new_orders:    list[PendingOrder],
     ) -> list[TradeEvent]:
         """
         Diff new_positions / new_orders against the stored state.
@@ -89,9 +89,8 @@ class StateManager:
         new_ord_map = {o.ticket: o for o in new_orders}
 
         if not self._initialised:
-            # First call — seed state without emitting events
-            self._positions = new_pos_map
-            self._orders = new_ord_map
+            self._positions   = new_pos_map
+            self._orders      = new_ord_map
             self._initialised = True
             logger.info(
                 f"State initialised: {len(new_pos_map)} positions, "
@@ -99,15 +98,11 @@ class StateManager:
             )
             return []
 
-        # ── Positions ──────────────────────────────────────────────
         events += self._diff_positions(new_pos_map)
-
-        # ── Pending orders ─────────────────────────────────────────
         events += self._diff_orders(new_ord_map)
 
-        # ── Update stored state ────────────────────────────────────
         self._positions = new_pos_map
-        self._orders = new_ord_map
+        self._orders    = new_ord_map
 
         return events
 
@@ -118,17 +113,16 @@ class StateManager:
         self._initialised = False
         logger.info("StateManager reset — next poll will re-baseline")
 
-    # ── Positions diff ─────────────────────────────────────────────
+    # ── Positions diff ─────────────────────────────────────────────────
 
     def _diff_positions(
         self, new_map: dict[int, Position]
     ) -> list[TradeEvent]:
-        events: list[TradeEvent] = []
+        events:  list[TradeEvent] = []
         old_map = self._positions
 
         for ticket, new_pos in new_map.items():
             if ticket not in old_map:
-                # Brand-new position
                 events.append(self._make_event(
                     EventType.NEW_POSITION,
                     new_pos.ticket,
@@ -140,20 +134,38 @@ class StateManager:
                     tp=new_pos.tp,
                 ))
             else:
-                old_pos = old_map[ticket]
-                # SL/TP or volume change
-                sl_changed = abs(new_pos.sl - old_pos.sl) > 1e-8
-                tp_changed = abs(new_pos.tp - old_pos.tp) > 1e-8
-                vol_decreased = new_pos.volume < old_pos.volume - 1e-4
+                old_pos     = old_map[ticket]
+                sl_changed  = abs(new_pos.sl - old_pos.sl) > 1e-8
+                tp_changed  = abs(new_pos.tp - old_pos.tp) > 1e-8
+                vol_delta   = new_pos.volume - old_pos.volume
 
-                if vol_decreased:
-                    # Partial close
+                if vol_delta < -1e-4:
+                    # Partial close — master reduced volume.
                     events.append(self._make_event(
                         EventType.PARTIAL_CLOSE,
                         ticket,
                         new_pos.symbol,
                         close_volume=round(old_pos.volume - new_pos.volume, 2),
                         volume=new_pos.volume,
+                    ))
+                elif vol_delta > 1e-4:
+                    # BUG 6 FIX: Volume increased on the master (e.g. broker
+                    # add-on, hedge partial close, or manual top-up). The
+                    # original code silently ignored this. We now emit a
+                    # MODIFY_POSITION event so the slave can reconcile.
+                    # We carry both the new total volume and any SL/TP changes
+                    # that may have arrived in the same tick.
+                    logger.info(
+                        f"Volume increased on master ticket={ticket} "
+                        f"{old_pos.volume} → {new_pos.volume}; emitting MODIFY"
+                    )
+                    events.append(self._make_event(
+                        EventType.MODIFY_POSITION,
+                        ticket,
+                        new_pos.symbol,
+                        volume=new_pos.volume,
+                        sl=new_pos.sl,
+                        tp=new_pos.tp,
                     ))
                 elif sl_changed or tp_changed:
                     events.append(self._make_event(
@@ -166,7 +178,6 @@ class StateManager:
 
         for ticket, old_pos in old_map.items():
             if ticket not in new_map:
-                # Position fully closed
                 events.append(self._make_event(
                     EventType.CLOSE_POSITION,
                     ticket,
@@ -176,12 +187,12 @@ class StateManager:
 
         return events
 
-    # ── Orders diff ────────────────────────────────────────────────
+    # ── Orders diff ────────────────────────────────────────────────────
 
     def _diff_orders(
         self, new_map: dict[int, PendingOrder]
     ) -> list[TradeEvent]:
-        events: list[TradeEvent] = []
+        events:  list[TradeEvent] = []
         old_map = self._orders
 
         for ticket, new_ord in new_map.items():
@@ -199,9 +210,9 @@ class StateManager:
             else:
                 old_ord = old_map[ticket]
                 changed = (
-                    abs(new_ord.price - old_ord.price) > 1e-8
-                    or abs(new_ord.sl - old_ord.sl) > 1e-8
-                    or abs(new_ord.tp - old_ord.tp) > 1e-8
+                    abs(new_ord.price  - old_ord.price)  > 1e-8
+                    or abs(new_ord.sl  - old_ord.sl)     > 1e-8
+                    or abs(new_ord.tp  - old_ord.tp)     > 1e-8
                     or abs(new_ord.volume - old_ord.volume) > 1e-4
                 )
                 if changed:
@@ -225,13 +236,13 @@ class StateManager:
 
         return events
 
-    # ── Factory helper ─────────────────────────────────────────────
+    # ── Factory helper ─────────────────────────────────────────────────
 
     @staticmethod
     def _make_event(
-        event_type: EventType,
+        event_type:    EventType,
         master_ticket: int,
-        symbol: str,
+        symbol:        str,
         **kwargs,
     ) -> TradeEvent:
         event = TradeEvent(
@@ -241,5 +252,8 @@ class StateManager:
             symbol=symbol,
             **kwargs,
         )
-        logger.debug(f"Event detected: {event_type.value} | ticket={master_ticket} | {symbol}")
+        logger.debug(
+            f"Event detected: {event_type.value} | "
+            f"ticket={master_ticket} | {symbol}"
+        )
         return event

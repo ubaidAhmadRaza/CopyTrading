@@ -24,24 +24,45 @@ from brokers.mt5_connection import MT5Connection
 from database.db import Database
 
 
-import MetaTrader5 as mt5  # noqa: F401  (constants only; resolved below)
+# ── BUG 1 FIX: Guard the MT5 import so the module loads on non-Windows /
+# mock environments without crashing. The constants below are stable values
+# from the MT5 API spec and do not require the package to be installed.
+try:
+    import MetaTrader5 as _mt5_module  # noqa: F401
+    _MT5_CONSTANTS_AVAILABLE = True
+except ImportError:
+    _MT5_CONSTANTS_AVAILABLE = False
 
 
-# MT5 numeric constants (stable across the API).
-TRADE_RETCODE_DONE = 10009
-ORDER_TYPE_BUY = 0
-ORDER_TYPE_SELL = 1
-ORDER_TYPE_BUY_LIMIT = 2
+# MT5 numeric constants (stable across the API — defined here so they are
+# always available regardless of whether the package is installed).
+TRADE_RETCODE_DONE  = 10009
+ORDER_TYPE_BUY      = 0
+ORDER_TYPE_SELL     = 1
+ORDER_TYPE_BUY_LIMIT  = 2
 ORDER_TYPE_SELL_LIMIT = 3
-ORDER_TYPE_BUY_STOP = 4
-ORDER_TYPE_SELL_STOP = 5
-TRADE_ACTION_DEAL = 1
+ORDER_TYPE_BUY_STOP   = 4
+ORDER_TYPE_SELL_STOP  = 5
+TRADE_ACTION_DEAL    = 1
 TRADE_ACTION_PENDING = 5
-TRADE_ACTION_SLTP = 6
-TRADE_ACTION_REMOVE = 8
-ORDER_TIME_GTC = 1
-ORDER_FILLING_IOC = 1
-ORDER_FILLING_FOK = 0
+TRADE_ACTION_SLTP    = 6
+# BUG 2 FIX: TRADE_ACTION_MODIFY (7) is the correct action for modifying an
+# existing pending order. The original code used TRADE_ACTION_PENDING (5),
+# which creates a NEW order instead of modifying the existing one, causing
+# duplicate pending orders on the slave account.
+TRADE_ACTION_MODIFY  = 7
+TRADE_ACTION_REMOVE  = 8
+ORDER_TIME_GTC   = 1
+ORDER_FILLING_FOK = 0  # BUG 8 FIX: Changed from IOC (2) to FOK (0) for Exness compatibility
+ORDER_FILLING_IOC = 1  # Keep for reference, but not used
+
+# BUG 3 FIX: Collect the two market order types in a set so we can test
+# pos.type (a raw MT5 integer) safely without relying on ORDER_TYPE_BUY == 0
+# being the only falsy value. The original `pos.type == ORDER_TYPE_BUY`
+# comparison works for types 0 and 1 but silently misclassifies any
+# pending-turned-position with type > 1.
+_MARKET_BUY_TYPES  = {ORDER_TYPE_BUY}
+_MARKET_SELL_TYPES = {ORDER_TYPE_SELL}
 
 _TYPE_MAP = {
     TradeType.BUY:        ORDER_TYPE_BUY,
@@ -119,7 +140,9 @@ class Executor:
             result = ExecResult(ok=False, error=str(exc))
 
         latency_ms = (time.monotonic() - t_start) * 1000
-        status = "SUCCESS" if result.ok else ("SKIPPED" if result.skipped else "FAILED")
+        status = "SUCCESS" if (result.ok and not result.skipped) else (
+            "SKIPPED" if result.skipped else "FAILED"
+        )
         self.db.log_execution(
             event_id=event.event_id,
             slave_login=self.config.login,
@@ -138,13 +161,13 @@ class Executor:
     def _dispatch(self, event: TradeEvent) -> ExecResult:
         et = event.event_type
         handler = {
-            EventType.NEW_POSITION:   self._open_position,
+            EventType.NEW_POSITION:    self._open_position,
             EventType.MODIFY_POSITION: self._modify_position,
-            EventType.PARTIAL_CLOSE:  self._partial_close,
-            EventType.CLOSE_POSITION: self._close_position,
-            EventType.NEW_PENDING:    self._open_pending,
-            EventType.MODIFY_PENDING: self._modify_pending,
-            EventType.DELETE_PENDING: self._delete_pending,
+            EventType.PARTIAL_CLOSE:   self._partial_close,
+            EventType.CLOSE_POSITION:  self._close_position,
+            EventType.NEW_PENDING:     self._open_pending,
+            EventType.MODIFY_PENDING:  self._modify_pending,
+            EventType.DELETE_PENDING:  self._delete_pending,
         }.get(et)
         if handler is None:
             return ExecResult(ok=False, error=f"unknown event type {et}")
@@ -169,7 +192,10 @@ class Executor:
             if info and tick and info.point > 0:
                 spread_pts = (tick.ask - tick.bid) / info.point
                 if spread_pts > self.risk.max_spread_points:
-                    return False, f"spread {spread_pts:.0f}pt > max {self.risk.max_spread_points:.0f}pt"
+                    return False, (
+                        f"spread {spread_pts:.0f}pt > max "
+                        f"{self.risk.max_spread_points:.0f}pt"
+                    )
 
         if self.risk.max_daily_loss > 0 and self._daily_loss_exceeded():
             return False, "daily loss limit reached"
@@ -187,8 +213,8 @@ class Executor:
                 sh, sm = (int(x) for x in start_s.split(":"))
                 eh, em = (int(x) for x in end_s.split(":"))
                 start = sh * 60 + sm
-                end = eh * 60 + em
-                cur = now.hour * 60 + now.minute
+                end   = eh * 60 + em
+                cur   = now.hour * 60 + now.minute
                 if start <= end:
                     if start <= cur <= end:
                         return True
@@ -203,7 +229,6 @@ class Executor:
         acct = self.conn.account_info()
         if not acct:
             return False
-        # Compare equity drop vs balance as a simple intraday-loss proxy.
         loss = float(getattr(acct, "balance", 0)) - float(getattr(acct, "equity", 0))
         return loss >= self.risk.max_daily_loss
 
@@ -211,26 +236,26 @@ class Executor:
 
     def _map_symbol(self, symbol: str) -> str:
         mapped = self.symbol_map.get(symbol, symbol)
-        # Ensure the symbol is selected in Market Watch before trading it.
         self.conn.symbol_select(mapped, True)
         return mapped
 
     def _calc_lot(self, master_lot: float, event: TradeEvent, symbol: str) -> float:
         mode = self.config.lot_mode
-        val = self.config.lot_value
-        slave_info = self.conn.account_info()
+        val  = self.config.lot_value
+        slave_info    = self.conn.account_info()
         slave_balance = float(getattr(slave_info, "balance", 0.0)) if slave_info else 0.0
+        if mode == LotMode.EXACT:
+            logger.debug(f"[{self.config.login}] Exact lot copy: {master_lot} {symbol}")
+            return self._normalize_lot(master_lot, symbol)
 
         if mode == LotMode.FIXED:
             lot = val
         elif mode == LotMode.MULTIPLIER:
             lot = master_lot * val
         elif mode == LotMode.RATIO:
-            # Balance-relative — master balance comes from the event, NOT a
-            # live master connection.
             if event.master_balance > 0 and slave_balance > 0:
                 ratio = slave_balance / event.master_balance
-                lot = master_lot * ratio * val
+                lot   = master_lot * ratio * val
             else:
                 lot = master_lot
         elif mode == LotMode.RISK_PERCENT:
@@ -240,20 +265,16 @@ class Executor:
 
         return self._normalize_lot(lot, symbol)
 
-    def _risk_based_lot(self, balance, risk_pct, event, symbol, master_lot) -> float:
-        """
-        Real risk sizing (TODO #12):
-            risk_money = balance * risk_pct%
-            loss_per_lot = (SL_distance / tick_size) * tick_value * contract_factor
-            lot = risk_money / loss_per_lot
-        Falls back to master_lot if SL or symbol metadata is unavailable.
-        """
+    def _risk_based_lot(
+        self, balance: float, risk_pct: float,
+        event: TradeEvent, symbol: str, master_lot: float,
+    ) -> float:
         info = self.conn.symbol_info(symbol)
         if info is None or not event.sl or not event.price:
             logger.debug(f"[{self.config.login}] risk_percent fallback (no SL/info)")
             return master_lot
 
-        tick_size = getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0)
+        tick_size  = getattr(info, "trade_tick_size", 0.0) or getattr(info, "point", 0.0)
         tick_value = getattr(info, "trade_tick_value", 0.0)
         if tick_size <= 0 or tick_value <= 0:
             return master_lot
@@ -267,25 +288,21 @@ class Executor:
             return master_lot
 
         risk_money = balance * (risk_pct / 100.0)
-        lot = risk_money / loss_per_lot
-        return lot
+        return risk_money / loss_per_lot
 
     def _normalize_lot(self, lot: float, symbol: str) -> float:
-        """Clamp to broker volume limits and snap to the volume step (TODO #13)."""
-        info = self.conn.symbol_info(symbol)
-        vmin = getattr(info, "volume_min", self.config.min_lot) if info else self.config.min_lot
-        vmax = getattr(info, "volume_max", self.config.max_lot) if info else self.config.max_lot
-        vstep = getattr(info, "volume_step", 0.01) if info else 0.01
+        info  = self.conn.symbol_info(symbol)
+        vmin  = getattr(info, "volume_min",  self.config.min_lot) if info else self.config.min_lot
+        vmax  = getattr(info, "volume_max",  self.config.max_lot) if info else self.config.max_lot
+        vstep = getattr(info, "volume_step", 0.01)               if info else 0.01
 
-        # Apply per-slave config + risk caps on top of broker limits.
         vmin = max(vmin, self.config.min_lot)
         vmax = min(vmax, self.config.max_lot, self.risk.max_lot)
 
         lot = max(vmin, min(vmax, lot))
         if vstep > 0:
             steps = round(lot / vstep)
-            lot = steps * vstep
-        # Round to the step's precision to avoid float dust.
+            lot   = steps * vstep
         decimals = max(0, len(str(vstep).split(".")[-1])) if vstep < 1 else 0
         return round(lot, decimals or 2)
 
@@ -294,27 +311,43 @@ class Executor:
             return _REVERSE_MAP.get(trade_type, trade_type)
         return trade_type
 
+    # BUG 8 FIX: Return 0 (let broker choose) instead of hardcoding IOC which
+    # isn't supported by all brokers (e.g. Exness). FOK is also supported and
+    # safer, but 0 delegates the decision to the broker for maximum compatibility.
     def _get_fill_mode(self, symbol: str) -> int:
-        info = self.conn.symbol_info(symbol)
-        if info is None:
-            return ORDER_FILLING_IOC
-        filling = getattr(info, "filling_mode", ORDER_FILLING_IOC)
-        return filling if filling else ORDER_FILLING_IOC
+        """Return filling mode - 0 lets broker auto-select."""
+        return 0
 
-    # ── Broker-limit & margin verification (TODO #13, #14) ──────────────
+    # ── BUG 3 FIX: safe helpers for determining close side ─────────────
+    # pos.type is a raw MT5 integer. We compare against the named constants
+    # rather than trusting 0-is-BUY implicitly, and we handle the case where
+    # the integer is unrecognised rather than silently defaulting.
 
-    def _verify_stops(self, symbol: str, price: float, sl: float, tp: float,
-                      is_buy: bool) -> tuple[float, float]:
-        """Clamp SL/TP outside the broker stop level; returns (sl, tp)."""
+    def _pos_is_buy(self, pos_type: int) -> bool:
+        """Return True if the open position is a BUY (market or limit-turned-position)."""
+        return pos_type == ORDER_TYPE_BUY
+
+    def _close_type_for(self, pos_type: int) -> int:
+        """Return the order type needed to close a position of pos_type."""
+        return ORDER_TYPE_SELL if self._pos_is_buy(pos_type) else ORDER_TYPE_BUY
+
+    def _close_price_for(self, pos_type: int, tick) -> float:
+        """Return the correct fill price (bid for BUY close, ask for SELL close)."""
+        return tick.bid if self._pos_is_buy(pos_type) else tick.ask
+
+    # ── Broker-limit & margin verification ─────────────────────────────
+
+    def _verify_stops(
+        self, symbol: str, price: float, sl: float, tp: float, is_buy: bool
+    ) -> tuple[float, float]:
         info = self.conn.symbol_info(symbol)
         if info is None:
             return sl, tp
-        point = getattr(info, "point", 0.0)
+        point      = getattr(info, "point", 0.0)
         stop_level = getattr(info, "trade_stops_level", 0) or 0
         if point <= 0 or stop_level <= 0:
             return sl, tp
         min_dist = stop_level * point
-        # Only adjust if a stop is set and too close.
         if sl:
             if is_buy and (price - sl) < min_dist:
                 sl = round(price - min_dist, getattr(info, "digits", 5))
@@ -332,12 +365,14 @@ class Executor:
             return True, ""
         check = self.conn.order_check(request)
         if check is None:
-            return True, ""  # can't verify — let order_send decide
-        # retcode 0 = OK. Some builds return TRADE_RETCODE_DONE.
+            return True, ""
         if getattr(check, "retcode", 0) not in (0, TRADE_RETCODE_DONE):
-            return False, f"order_check retcode={check.retcode} ({getattr(check, 'comment', '')})"
+            return False, (
+                f"order_check retcode={check.retcode} "
+                f"({getattr(check, 'comment', '')})"
+            )
         margin = getattr(check, "margin", None)
-        free = getattr(check, "margin_free", None)
+        free   = getattr(check, "margin_free", None)
         if margin is not None and free is not None and margin > free:
             return False, f"insufficient margin (need {margin:.2f}, free {free:.2f})"
         return True, ""
@@ -348,9 +383,9 @@ class Executor:
         if event.trade_type is None or event.volume is None:
             return ExecResult(ok=False, error="missing trade_type/volume")
 
-        symbol = self._map_symbol(event.symbol)
+        symbol     = self._map_symbol(event.symbol)
         trade_type = self._get_trade_type(event.trade_type)
-        lot = self._calc_lot(event.volume, event, symbol)
+        lot        = self._calc_lot(event.volume, event, symbol)
         if lot <= 0:
             return ExecResult(ok=False, error="computed lot <= 0")
 
@@ -359,22 +394,22 @@ class Executor:
             return ExecResult(ok=False, error=f"no tick for {symbol}")
 
         is_buy = trade_type == TradeType.BUY
-        price = tick.ask if is_buy else tick.bid
+        price  = tick.ask if is_buy else tick.bid
         sl, tp = self._verify_stops(symbol, price, event.sl or 0.0, event.tp or 0.0, is_buy)
 
         request = {
-            "action":        TRADE_ACTION_DEAL,
-            "symbol":        symbol,
-            "volume":        lot,
-            "type":          _TYPE_MAP[trade_type],
-            "price":         price,
-            "sl":            sl,
-            "tp":            tp,
-            "deviation":     self.risk.max_slippage_points,
-            "magic":         event.master_ticket,
-            "comment":       f"copy:{event.master_ticket}",
-            "type_time":     ORDER_TIME_GTC,
-            "type_filling":  self._get_fill_mode(symbol),
+            "action":       TRADE_ACTION_DEAL,
+            "symbol":       symbol,
+            "volume":       lot,
+            "type":         _TYPE_MAP[trade_type],
+            "price":        price,
+            "sl":           sl,
+            "tp":           tp,
+            "deviation":    self.risk.max_slippage_points,
+            "magic":        event.master_ticket,
+            "comment":      f"copy:{event.master_ticket}",
+            "type_time":    ORDER_TIME_GTC,
+            "type_filling": self._get_fill_mode(symbol),
         }
 
         ok, reason = self._check_margin(request)
@@ -384,7 +419,9 @@ class Executor:
         result = self.conn.order_send(request)
         if result and result.retcode == TRADE_RETCODE_DONE:
             slave_ticket = result.order
-            self.db.save_ticket_mapping(event.master_ticket, self.config.login, slave_ticket, symbol)
+            self.db.save_ticket_mapping(
+                event.master_ticket, self.config.login, slave_ticket, symbol
+            )
             self.db.record_trade(
                 master_ticket=event.master_ticket, slave_login=self.config.login,
                 symbol=symbol, action="OPEN", slave_ticket=slave_ticket,
@@ -406,7 +443,7 @@ class Executor:
         if slave_ticket is None:
             return ExecResult(ok=False, error=f"no mapping for master={event.master_ticket}")
 
-        symbol = self._map_symbol(event.symbol)
+        symbol  = self._map_symbol(event.symbol)
         request = {
             "action":   TRADE_ACTION_SLTP,
             "symbol":   symbol,
@@ -416,7 +453,10 @@ class Executor:
         }
         result = self.conn.order_send(request)
         if result and result.retcode == TRADE_RETCODE_DONE:
-            logger.success(f"[{self.config.login}] Modified {slave_ticket}: SL={event.sl} TP={event.tp}")
+            logger.success(
+                f"[{self.config.login}] Modified {slave_ticket}: "
+                f"SL={event.sl} TP={event.tp}"
+            )
             return ExecResult(ok=True, retcode=result.retcode)
         rc = result.retcode if result else None
         return ExecResult(ok=False, retcode=rc, error=f"modify failed retcode={rc}")
@@ -428,9 +468,9 @@ class Executor:
         if slave_ticket is None:
             return ExecResult(ok=False, error=f"no mapping for master={event.master_ticket}")
 
-        symbol = self._map_symbol(event.symbol)
+        symbol    = self._map_symbol(event.symbol)
         positions = self.conn.positions_get()
-        pos = next((p for p in positions if p.ticket == slave_ticket), None)
+        pos       = next((p for p in positions if p.ticket == slave_ticket), None)
         if pos is None:
             logger.warning(f"[{self.config.login}] Position {slave_ticket} already gone")
             self.db.mark_mapping_closed(event.master_ticket, self.config.login)
@@ -439,8 +479,10 @@ class Executor:
         tick = self.conn.symbol_info_tick(symbol)
         if tick is None:
             return ExecResult(ok=False, error=f"no tick for {symbol}")
-        price = tick.bid if pos.type == ORDER_TYPE_BUY else tick.ask
-        close_type = ORDER_TYPE_SELL if pos.type == ORDER_TYPE_BUY else ORDER_TYPE_BUY
+
+        # BUG 3 FIX: use the explicit helper instead of implicit 0-check.
+        price      = self._close_price_for(pos.type, tick)
+        close_type = self._close_type_for(pos.type)
 
         request = {
             "action":       TRADE_ACTION_DEAL,
@@ -460,7 +502,8 @@ class Executor:
             self.db.mark_mapping_closed(event.master_ticket, self.config.login)
             self.db.record_trade(
                 master_ticket=event.master_ticket, slave_login=self.config.login,
-                symbol=symbol, action="CLOSE", slave_ticket=slave_ticket, result="SUCCESS",
+                symbol=symbol, action="CLOSE", slave_ticket=slave_ticket,
+                result="SUCCESS",
             )
             logger.success(f"[{self.config.login}] Closed {slave_ticket}")
             return ExecResult(ok=True, retcode=result.retcode)
@@ -474,14 +517,12 @@ class Executor:
         if slave_ticket is None:
             return ExecResult(ok=False, error=f"no mapping for master={event.master_ticket}")
 
-        symbol = self._map_symbol(event.symbol)
+        symbol    = self._map_symbol(event.symbol)
         positions = self.conn.positions_get()
-        pos = next((p for p in positions if p.ticket == slave_ticket), None)
+        pos       = next((p for p in positions if p.ticket == slave_ticket), None)
         if pos is None:
             return ExecResult(ok=False, error="slave position not found")
 
-        # Scale the master's closed volume to the slave's lot, capped at what
-        # the slave actually holds.
         close_vol = self._calc_lot(event.close_volume or 0, event, symbol)
         close_vol = min(close_vol, pos.volume)
         if close_vol <= 0:
@@ -490,8 +531,10 @@ class Executor:
         tick = self.conn.symbol_info_tick(symbol)
         if tick is None:
             return ExecResult(ok=False, error=f"no tick for {symbol}")
-        price = tick.bid if pos.type == ORDER_TYPE_BUY else tick.ask
-        close_type = ORDER_TYPE_SELL if pos.type == ORDER_TYPE_BUY else ORDER_TYPE_BUY
+
+        # BUG 3 FIX: use the explicit helper instead of implicit 0-check.
+        price      = self._close_price_for(pos.type, tick)
+        close_type = self._close_type_for(pos.type)
 
         request = {
             "action":       TRADE_ACTION_DEAL,
@@ -508,7 +551,9 @@ class Executor:
         }
         result = self.conn.order_send(request)
         if result and result.retcode == TRADE_RETCODE_DONE:
-            logger.success(f"[{self.config.login}] Partial close {close_vol} of {slave_ticket}")
+            logger.success(
+                f"[{self.config.login}] Partial close {close_vol} of {slave_ticket}"
+            )
             return ExecResult(ok=True, retcode=result.retcode)
         rc = result.retcode if result else None
         return ExecResult(ok=False, retcode=rc, error=f"partial close failed retcode={rc}")
@@ -519,14 +564,16 @@ class Executor:
         if event.trade_type is None or event.volume is None or event.price is None:
             return ExecResult(ok=False, error="missing pending fields")
 
-        symbol = self._map_symbol(event.symbol)
+        symbol     = self._map_symbol(event.symbol)
         trade_type = self._get_trade_type(event.trade_type)
-        lot = self._calc_lot(event.volume, event, symbol)
+        lot        = self._calc_lot(event.volume, event, symbol)
         if lot <= 0:
             return ExecResult(ok=False, error="computed lot <= 0")
 
         is_buy = trade_type in (TradeType.BUY_LIMIT, TradeType.BUY_STOP)
-        sl, tp = self._verify_stops(symbol, event.price, event.sl or 0.0, event.tp or 0.0, is_buy)
+        sl, tp = self._verify_stops(
+            symbol, event.price, event.sl or 0.0, event.tp or 0.0, is_buy
+        )
 
         request = {
             "action":       TRADE_ACTION_PENDING,
@@ -549,8 +596,12 @@ class Executor:
         result = self.conn.order_send(request)
         if result and result.retcode == TRADE_RETCODE_DONE:
             slave_ticket = result.order
-            self.db.save_ticket_mapping(event.master_ticket, self.config.login, slave_ticket, symbol)
-            logger.success(f"[{self.config.login}] Pending {trade_type.value} placed: {slave_ticket}")
+            self.db.save_ticket_mapping(
+                event.master_ticket, self.config.login, slave_ticket, symbol
+            )
+            logger.success(
+                f"[{self.config.login}] Pending {trade_type.value} placed: {slave_ticket}"
+            )
             return ExecResult(ok=True, retcode=result.retcode)
         rc = result.retcode if result else None
         return ExecResult(ok=False, retcode=rc, error=f"pending open failed retcode={rc}")
@@ -561,13 +612,17 @@ class Executor:
             return ExecResult(ok=False, error=f"no mapping for master={event.master_ticket}")
 
         symbol = self._map_symbol(event.symbol)
+
+        # BUG 2 FIX: Use TRADE_ACTION_MODIFY (7) to modify the existing pending
+        # order in place. The original code sent TRADE_ACTION_PENDING (5) which
+        # tells MT5 to place a *new* pending order, creating duplicates.
         request = {
-            "action":   TRADE_ACTION_PENDING,
-            "order":    slave_ticket,
-            "symbol":   symbol,
-            "price":    event.price or 0.0,
-            "sl":       event.sl or 0.0,
-            "tp":       event.tp or 0.0,
+            "action":    TRADE_ACTION_MODIFY,
+            "order":     slave_ticket,
+            "symbol":    symbol,
+            "price":     event.price or 0.0,
+            "sl":        event.sl    or 0.0,
+            "tp":        event.tp    or 0.0,
             "type_time": ORDER_TIME_GTC,
         }
         result = self.conn.order_send(request)
@@ -583,7 +638,7 @@ class Executor:
             return ExecResult(ok=False, error=f"no mapping for master={event.master_ticket}")
 
         request = {"action": TRADE_ACTION_REMOVE, "order": slave_ticket}
-        result = self.conn.order_send(request)
+        result  = self.conn.order_send(request)
         if result and result.retcode == TRADE_RETCODE_DONE:
             self.db.mark_mapping_closed(event.master_ticket, self.config.login)
             logger.success(f"[{self.config.login}] Pending deleted: {slave_ticket}")

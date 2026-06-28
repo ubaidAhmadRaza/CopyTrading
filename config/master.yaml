@@ -3,14 +3,14 @@ role: master
 master:
   terminal_path: "C:\\Trading\\MetaTraderMaster\\terminal64.exe"
   login: 474114385
-  password: "Investor@123"
-  server: "XYLOMARKETS-server"
+  password: "p&VRp6X?H?qP2Ae"
+  server: "Exness-MT5Trial15"
 
 symbol_mapping:
   XAUUSD: XAUUSDm
   EURUSD: EURUSD.a
   GBPUSD: GBPUSDm
-  BTCUSD: BTCUSDm
+  BTCUSDm: BTCUSDm
 
 settings:
   poll_interval_ms: 250
